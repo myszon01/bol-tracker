@@ -11,7 +11,15 @@
 {-# LANGUAGE TypeFamilies          #-}
 {-# LANGUAGE TypeOperators         #-}
 
-module BoLTracker () where
+module BoLTracker (
+    BoLTrackerParams(..)
+    , BoLSignature(..)
+    , BoLTrackerActions(..)
+    , StartBTP(..)
+    , startBTP
+    , finishLoading
+    , updateLocation
+) where
 
 import           Control.Monad                hiding (fmap)
 import           Data.Aeson                   (FromJSON, ToJSON)
@@ -154,3 +162,29 @@ finishLoading btp = void $ mapErrorSM $ runStep (btpClient btp) FinishLoading
 
 updateLocation :: BoLTrackerParams -> BuiltinByteString -> Contract w s Text ()
 updateLocation btp location = void $ mapErrorSM $ runStep (btpClient btp) $ CurrentLocation location
+
+
+type BTPStartSchema =
+        Endpoint "startBTP"      StartBTP
+type BTPUseSchema =
+        Endpoint "finish loading" ()
+    .\/ Endpoint "update location" BuiltinByteString
+
+startEndpoint :: Contract (Last TokenSale) BTPStartSchema Text ()
+startEndpoint = forever
+              $ handleError logError
+              $ awaitPromise
+              $ endpoint @"startBTP" $ startBTP . StartBTP
+
+useEndpoints' :: ( HasEndpoint "finish loading" () s
+                 , HasEndpoint "update location" BuiltinByteString s
+                 )
+              => BoLTrackerParams
+              -> Promise () s Text ()
+useEndpoints' btp = setPrice' `select` addTokens'
+  where
+    finishLoading'  = endpoint @"finish loading"  $ \()      -> handleError logError (finishLoading btp)
+    updateLocation' = endpoint @"add tokens" $ \location      -> handleError logError (updateLocation btp location)
+
+useEndpoints :: BoLTrackerParams -> Contract () BTPUseSchema Text ()
+useEndpoints = forever . awaitPromise . useEndpoints'
