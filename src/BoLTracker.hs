@@ -1,131 +1,141 @@
-{-# LANGUAGE DataKinds             #-}
-{-# LANGUAGE DeriveAnyClass        #-}
-{-# LANGUAGE DeriveGeneric         #-}
-{-# LANGUAGE FlexibleContexts      #-}
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE DeriveAnyClass #-}
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
-{-# LANGUAGE NoImplicitPrelude     #-}
-{-# LANGUAGE OverloadedStrings     #-}
-{-# LANGUAGE ScopedTypeVariables   #-}
-{-# LANGUAGE TemplateHaskell       #-}
-{-# LANGUAGE TypeApplications      #-}
-{-# LANGUAGE TypeFamilies          #-}
-{-# LANGUAGE TypeOperators         #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE TypeOperators #-}
+{-# LANGUAGE NoImplicitPrelude #-}
 
-module BoLTracker (
-    BoLTrackerParams(..)
-    , BoLSignature(..)
-    , BoLTrackerActions(..)
-    , StartBTP(..)
-    , startBTP
-    , finishLoading
-    , updateLocation
-) where
+module BoLTracker
+  ( BoLTrackerParams (..),
+    BoLSignature (..),
+    BoLTrackerActions (..),
+    StartBTP (..),
+    startEndpoint,
+    useEndpoints,
+    useEndpoints',
+    btpClient,
+  )
+where
 
-import           Control.Monad                hiding (fmap)
-import           Data.Aeson                   (FromJSON, ToJSON)
-import           Data.Monoid                  (Last (..))
-import           Data.Text                    (Text, pack)
-import           GHC.Generics                 (Generic)
-import           Plutus.Contract              as Contract
-import           Plutus.Contract.StateMachine
-import qualified PlutusTx
-import           PlutusTx.Prelude             hiding (Semigroup(..), check, unless)
-import           Ledger                       hiding (singleton)
-import           Ledger.Ada                   as Ada
-import           Ledger.Constraints           as Constraints
-import qualified Ledger.Typed.Scripts         as Scripts
-import           Ledger.Value
-import           Prelude                      (Semigroup (..), Show (..))
-import qualified Prelude
-import Data.Bool (Bool(True))
-import Language.Haskell.TH (location)
+import Control.Monad hiding (fmap)
+import Data.Aeson (FromJSON, ToJSON)
+import Data.Monoid (Last (..))
+import Data.Text (Text, pack)
+import GHC.Generics (Generic)
+import Ledger hiding (singleton)
+import Ledger.Constraints as Constraints
+import Ledger.Typed.Scripts qualified as Scripts
+import Plutus.Contract as Contract
+import Plutus.Contract.StateMachine
+import PlutusTx qualified
+import PlutusTx.Prelude hiding (Semigroup (..), check, unless)
+import Prelude (Show (..))
+import Prelude qualified
 
 -- ON CHAIN --
-
+-- Cant use ! (https://cardano.stackexchange.com/questions/9124/ghc-error-when-adding-tokenname-to-nftmint-params)
 data BoLTrackerParams = BoLTrackerParams
-    { btpShipper :: !PaymentPubKeyHash
-    , btpReciver :: !PaymentPubKeyHash
-    , btpCarrier :: !PaymentPubKeyHash
-    , btpBoLURL  :: !BuiltinByteString
-    , btpTT     :: !ThreadToken
-    } deriving (Show, Generic, FromJSON, ToJSON, Prelude.Eq)
+  { btpShipper :: PaymentPubKeyHash,
+    btpCarrier :: PaymentPubKeyHash,
+    btpReciver :: PaymentPubKeyHash,
+    btpBoLURL :: BuiltinByteString,
+    btpTT :: ThreadToken
+  }
+  deriving (Show, Generic, FromJSON, ToJSON, Prelude.Eq)
 
+PlutusTx.unstableMakeIsData ''BoLTrackerParams
 PlutusTx.makeLift ''BoLTrackerParams
 
-data BoLTrackerState =
-      Loading
-    | Shipped 
-    | InTransit [BuiltinByteString]
-    | Unload
-    | Delivered
-    | Rejected
-    deriving (Show, Prelude.Eq)
+data BoLTrackerState
+  = Loading
+  | InTransit [BuiltinByteString]
+  | InTransitRejected [BuiltinByteString]
+  | Unloaded
+  | Delivered (Maybe BuiltinByteString)
+  | Rejected (Maybe BuiltinByteString)
+  deriving (Show, Prelude.Eq)
 
-instance Eq BoLTrackerState where
-    {-# INLINABLE (==) #-}
-    Loading == Loading = True
-    Shipped == Shipped = True
-    (InTransit loc) == (InTransit loc' pks') =
-        loc == loc'
-    Delivered == Delivered = True
-    Rejected == Rejected = True
-    _ == _ = False
+-- instance Eq BoLTrackerState where
+--   {-# INLINEABLE (==) #-}
+--   Loading == Loading = True
+--   (InTransit loc) == (InTransit loc') =
+--     loc == loc'
+--   Delivered == Delivered = True
+--   Rejected == Rejected = True
+--   _ == _ = False
 
 PlutusTx.unstableMakeIsData ''BoLTrackerState
 PlutusTx.makeLift ''BoLTrackerState
 
-data BoLSignature = Accepted | Rejected
-    deriving (Show, Generic, FromJSON, ToJSON, ToSchema, Prelude.Eq, Prelude.Ord)
+data BoLSignature = Accept | Reject
+  deriving (Show, Generic, FromJSON, ToJSON, Prelude.Eq, Prelude.Ord)
 
 instance Eq BoLSignature where
-    {-# INLINABLE (==) #-}
-    Accepted == Accepted = True
-    Rejected == Rejected  = True
-    _    == _    = False
+  {-# INLINEABLE (==) #-}
+  Accept == Accept = True
+  Reject == Reject = True
+  _ == _ = False
 
 PlutusTx.unstableMakeIsData ''BoLSignature
+PlutusTx.makeLift ''BoLSignature
 
-data BoLTrackerActions =
-    FinishLoading
-    | SignBol BoLSignature (Maybe BuiltinByteString)
-    | CurrentLocation BuiltinByteString
-    | UnloadFreight
-    deriving (Show, Prelude.Eq)
+data BoLTrackerActions
+  = FinishLoading
+  | CurrentLocation BuiltinByteString
+  | UnloadFreight BoLSignature (Maybe BuiltinByteString)
+  deriving (Show, Prelude.Eq)
 
 PlutusTx.unstableMakeIsData ''BoLTrackerActions
+PlutusTx.makeLift ''BoLTrackerActions
 
-{-# INLINABLE transition #-}
+{-# INLINEABLE transition #-}
 transition :: BoLTrackerParams -> State BoLTrackerState -> BoLTrackerActions -> Maybe (TxConstraints Void Void, State BoLTrackerState)
 transition btp s r = case (stateValue s, stateData s, r) of
-    (v, Loading, FinishLoading) -> 
-        Just ( Constraints.mustBeSignedBy (btpShipper btp), State (InTransit []) v)
-    (v, InTransit locations, CurrentLocation location)  -> 
-        Just ( Constraints.mustBeSignedBy (btpCarrier btp), State (InTransit $ locations : location) v)
-    _   ->  Nothing
+  (v, Loading, FinishLoading) ->
+    Just (Constraints.mustBeSignedBy (btpShipper btp), State (InTransit []) v)
+  (v, InTransit locations, CurrentLocation location) ->
+    Just (Constraints.mustBeSignedBy (btpCarrier btp), State (InTransit $ locations ++ [location]) v)
+  (v, InTransit _, UnloadFreight Accept maybeNotes) ->
+    Just (Constraints.mustBeSignedBy (btpReciver btp), State (Delivered maybeNotes) v)
+  (v, InTransit _, UnloadFreight Reject maybeNotes) ->
+    Just (Constraints.mustBeSignedBy (btpReciver btp), State (Rejected maybeNotes) v)
+  (v, Rejected _, CurrentLocation location) ->
+    Just (Constraints.mustBeSignedBy (btpCarrier btp), State (InTransitRejected [location]) v)
+  (v, InTransitRejected locations, CurrentLocation location) ->
+    Just (Constraints.mustBeSignedBy (btpCarrier btp), State (InTransitRejected $ locations ++ [location]) v)
+  (v, InTransitRejected _, UnloadFreight Accept maybeNotes) ->
+    Just (Constraints.mustBeSignedBy (btpCarrier btp), State (Delivered maybeNotes) v)
+  _ -> Nothing
 
-
-{-# INLINABLE isFinal #-}
+{-# INLINEABLE isFinal #-}
 isFinal :: BoLTrackerState -> Bool
-isFinal Delivered = True
-isFinal _        = False
+isFinal (Delivered _) = True
+isFinal _ = False
 
-{-# INLINABLE btpStateMachine #-}
+{-# INLINEABLE btpStateMachine #-}
 btpStateMachine :: BoLTrackerParams -> StateMachine BoLTrackerState BoLTrackerActions
 btpStateMachine btp = mkStateMachine (Just $ btpTT btp) (transition btp) isFinal
 
-{-# INLINABLE mkBTPValidator #-}
+{-# INLINEABLE mkBTPValidator #-}
 mkBTPValidator :: BoLTrackerParams -> BoLTrackerState -> BoLTrackerActions -> ScriptContext -> Bool
 mkBTPValidator = mkValidator . btpStateMachine
 
 type BTP = StateMachine BoLTrackerState BoLTrackerActions
 
 btpTypedValidator :: BoLTrackerParams -> Scripts.TypedValidator BTP
-btpTypedValidator = Scripts.mkTypedValidatorParam @BTP
-    $$(PlutusTx.compile [|| mkBTPValidator ||])
-    $$(PlutusTx.compile [|| wrap ||])
-    where
-        wrap = Scripts.mkUntypedValidator
-
+btpTypedValidator =
+  Scripts.mkTypedValidatorParam @BTP
+    $$(PlutusTx.compile [||mkBTPValidator||])
+    $$(PlutusTx.compile [||wrap||])
+  where
+    wrap = Scripts.mkUntypedValidator
 
 btpClient :: BoLTrackerParams -> StateMachineClient BoLTrackerState BoLTrackerActions
 btpClient btp = mkStateMachineClient $ StateMachineInstance (btpStateMachine btp) (btpTypedValidator btp)
@@ -133,29 +143,33 @@ btpClient btp = mkStateMachineClient $ StateMachineInstance (btpStateMachine btp
 mapErrorSM :: Contract w s SMContractError a -> Contract w s Text a
 mapErrorSM = mapError $ pack . show
 
-
 -- OFF CHAIN --
 data StartBTP = StartBTP
-    { btpShipper :: !PaymentPubKeyHash
-    , btpReciver :: !PaymentPubKeyHash
-    , btpCarrier :: !PaymentPubKeyHash
-    , btpBoLURL  :: !BuiltinByteString
-    } deriving (Show, Generic, FromJSON, ToJSON)
+  { sbtpShipper :: !PaymentPubKeyHash,
+    sbtpReciver :: !PaymentPubKeyHash,
+    sbtpCarrier :: !PaymentPubKeyHash,
+    sbtpBoLURL :: !BuiltinByteString
+  }
+  deriving (Show, Generic, FromJSON, ToJSON)
 
-startBTP :: StartBTP -> Contract (Last TokenSale) s Text ()
+PlutusTx.unstableMakeIsData ''StartBTP
+PlutusTx.makeLift ''StartBTP
+
+startBTP :: StartBTP -> Contract (Last BoLTrackerParams) s Text ()
 startBTP sbtp = do
-    tt  <- mapErrorSM getThreadToken
-    let btp = BoLTrackerParams
-            { btpShipper = btpShipper sbtp
-            , btpReciver = btpReciver sbtp
-            , btpCarrier = btpCarrier sbtp
-            , btpBoLURL = btpBoLURL sbtp
-            , tsTT     = tt
-            }
-        client = btpClient btp
-    void $ mapErrorSM $ runInitialise client Loading mempty
-    tell $ Last $ Just btp
-    logInfo $ "started loading freight" ++ show btp
+  tt <- mapErrorSM getThreadToken
+  let btp =
+        BoLTrackerParams
+          { btpShipper = sbtpShipper sbtp,
+            btpCarrier = sbtpCarrier sbtp,
+            btpReciver = sbtpReciver sbtp,
+            btpBoLURL = sbtpBoLURL sbtp,
+            btpTT = tt
+          }
+      client = btpClient btp
+  void $ mapErrorSM $ runInitialise client Loading mempty
+  tell $ Last $ Just btp
+  logInfo $ "started loading freight" ++ show btp
 
 finishLoading :: BoLTrackerParams -> Contract w s Text ()
 finishLoading btp = void $ mapErrorSM $ runStep (btpClient btp) FinishLoading
@@ -163,28 +177,31 @@ finishLoading btp = void $ mapErrorSM $ runStep (btpClient btp) FinishLoading
 updateLocation :: BoLTrackerParams -> BuiltinByteString -> Contract w s Text ()
 updateLocation btp location = void $ mapErrorSM $ runStep (btpClient btp) $ CurrentLocation location
 
-
 type BTPStartSchema =
-        Endpoint "startBTP"      StartBTP
+  Endpoint "start contract" StartBTP
+
 type BTPUseSchema =
-        Endpoint "finish loading" ()
+  Endpoint "finish loading" ()
     .\/ Endpoint "update location" BuiltinByteString
 
-startEndpoint :: Contract (Last TokenSale) BTPStartSchema Text ()
-startEndpoint = forever
-              $ handleError logError
-              $ awaitPromise
-              $ endpoint @"startBTP" $ startBTP . StartBTP
+startEndpoint :: Contract (Last BoLTrackerParams) BTPStartSchema Text ()
+startEndpoint =
+  forever $
+    handleError logError $
+      awaitPromise $
+        endpoint @"start contract" $
+          startBTP
 
-useEndpoints' :: ( HasEndpoint "finish loading" () s
-                 , HasEndpoint "update location" BuiltinByteString s
-                 )
-              => BoLTrackerParams
-              -> Promise () s Text ()
-useEndpoints' btp = setPrice' `select` addTokens'
+useEndpoints' ::
+  ( HasEndpoint "finish loading" () s,
+    HasEndpoint "update location" BuiltinByteString s
+  ) =>
+  BoLTrackerParams ->
+  Promise () s Text ()
+useEndpoints' btp = finishLoading' `select` updateLocation'
   where
-    finishLoading'  = endpoint @"finish loading"  $ \()      -> handleError logError (finishLoading btp)
-    updateLocation' = endpoint @"add tokens" $ \location      -> handleError logError (updateLocation btp location)
+    finishLoading' = endpoint @"finish loading" $ \() -> handleError logError (finishLoading btp)
+    updateLocation' = endpoint @"update location" $ \location -> handleError logError (updateLocation btp location)
 
 useEndpoints :: BoLTrackerParams -> Contract () BTPUseSchema Text ()
 useEndpoints = forever . awaitPromise . useEndpoints'
