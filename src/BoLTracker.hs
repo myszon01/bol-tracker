@@ -30,6 +30,7 @@ import           Ledger.Value
 import           Prelude                      (Semigroup (..), Show (..))
 import qualified Prelude
 import Data.Bool (Bool(True))
+import Language.Haskell.TH (location)
 
 -- ON CHAIN --
 
@@ -90,9 +91,9 @@ transition :: BoLTrackerParams -> State BoLTrackerState -> BoLTrackerActions -> 
 transition btp s r = case (stateValue s, stateData s, r) of
     (v, Loading, FinishLoading) -> 
         Just ( Constraints.mustBeSignedBy (btpShipper btp), State (InTransit []) v)
-    (v, InTransit locations, CurrentLocation location) -> 
+    (v, InTransit locations, CurrentLocation location)  -> 
         Just ( Constraints.mustBeSignedBy (btpCarrier btp), State (InTransit $ locations : location) v)
-    _                                                              -> Nothing
+    _   ->  Nothing
 
 
 {-# INLINABLE isFinal #-}
@@ -102,7 +103,7 @@ isFinal _        = False
 
 {-# INLINABLE btpStateMachine #-}
 btpStateMachine :: BoLTrackerParams -> StateMachine BoLTrackerState BoLTrackerActions
-btpStateMachine btp = mkStateMachine Nothing (transition btp) isFinal
+btpStateMachine btp = mkStateMachine (Just $ btpTT btp) (transition btp) isFinal
 
 {-# INLINABLE mkBTPValidator #-}
 mkBTPValidator :: BoLTrackerParams -> BoLTrackerState -> BoLTrackerActions -> ScriptContext -> Bool
@@ -126,3 +127,30 @@ mapErrorSM = mapError $ pack . show
 
 
 -- OFF CHAIN --
+data StartBTP = StartBTP
+    { btpShipper :: !PaymentPubKeyHash
+    , btpReciver :: !PaymentPubKeyHash
+    , btpCarrier :: !PaymentPubKeyHash
+    , btpBoLURL  :: !BuiltinByteString
+    } deriving (Show, Generic, FromJSON, ToJSON)
+
+startBTP :: StartBTP -> Contract (Last TokenSale) s Text ()
+startBTP sbtp = do
+    tt  <- mapErrorSM getThreadToken
+    let btp = BoLTrackerParams
+            { btpShipper = btpShipper sbtp
+            , btpReciver = btpReciver sbtp
+            , btpCarrier = btpCarrier sbtp
+            , btpBoLURL = btpBoLURL sbtp
+            , tsTT     = tt
+            }
+        client = btpClient btp
+    void $ mapErrorSM $ runInitialise client Loading mempty
+    tell $ Last $ Just btp
+    logInfo $ "started loading freight" ++ show btp
+
+finishLoading :: BoLTrackerParams -> Contract w s Text ()
+finishLoading btp = void $ mapErrorSM $ runStep (btpClient btp) FinishLoading
+
+updateLocation :: BoLTrackerParams -> BuiltinByteString -> Contract w s Text ()
+updateLocation btp location = void $ mapErrorSM $ runStep (btpClient btp) $ CurrentLocation location
