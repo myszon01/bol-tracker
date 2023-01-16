@@ -1,0 +1,34 @@
+cabal-version:      2.4
+name:               bol-tracker
+version:            0.1.0.0
+
+library
+  hs-source-dirs:      src
+  exposed-modules:     MyLib
+                     , StateMachine
+                     , TestStateMachine
+                     , TokenSaleWithClose
+  build-depends:       aeson
+                     , base ^>=4.14.3.0
+                     , containers
+                     , data-default
+                     , freer-extras
+                     , playground-common
+                     , plutus-contract
+                     , plutus-ledger
+                     , plutus-ledger-constraints
+                     , plutus-ledger-api
+                     , plutus-tx-plugin
+                     , plutus-tx
+                     , plutus-use-cases
+                     , prettyprinter
+                     , text
+                     , plutus-script-utils
+                     , bytestring
+                     , lens
+                     , plutus-chain-index-core
+                     , cardano-node-emulator
+                
+
+  default-language:    Haskell2010
+  ghc-options:         -Wall -fobject-code -fno-ignore-interface-pragmas -fno-omit-interface-pragmas -fno-strictness -fno-spec-constr -fno-specialise
