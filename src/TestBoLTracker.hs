@@ -6,7 +6,7 @@
 {-# LANGUAGE TypeApplications #-}
 
 module TestBoLTracker
-  ( runMyTrace,
+  ( runContract,
     TraceType (..),
   )
 where
