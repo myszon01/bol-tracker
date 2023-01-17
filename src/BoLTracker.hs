@@ -4,6 +4,7 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TemplateHaskell #-}
@@ -17,6 +18,7 @@ module BoLTracker
     BoLSignature (..),
     BoLTrackerActions (..),
     StartBTP (..),
+    UnloadFreightParams (..),
     startEndpoint,
     useEndpoints,
     useEndpoints',
@@ -34,9 +36,10 @@ import Ledger.Constraints as Constraints
 import Ledger.Typed.Scripts qualified as Scripts
 import Plutus.Contract as Contract
 import Plutus.Contract.StateMachine
+import Plutus.Script.Utils.V2.Typed.Scripts (tyTxOutData, tyTxOutRefOut)
 import PlutusTx qualified
 import PlutusTx.Prelude hiding (Semigroup (..), check, unless)
-import Prelude (Show (..))
+import Prelude (Show (..), String)
 import Prelude qualified
 
 -- ON CHAIN --
@@ -57,19 +60,21 @@ data BoLTrackerState
   = Loading
   | InTransit [BuiltinByteString]
   | InTransitRejected [BuiltinByteString]
-  | Unloaded
-  | Delivered (Maybe BuiltinByteString)
-  | Rejected (Maybe BuiltinByteString)
+  | Delivered BuiltinByteString
+  | Rejected BuiltinByteString
+  | Finished
   deriving (Show, Prelude.Eq)
 
--- instance Eq BoLTrackerState where
---   {-# INLINEABLE (==) #-}
---   Loading == Loading = True
---   (InTransit loc) == (InTransit loc') =
---     loc == loc'
---   Delivered == Delivered = True
---   Rejected == Rejected = True
---   _ == _ = False
+instance Eq BoLTrackerState where
+  {-# INLINEABLE (==) #-}
+  Loading == Loading = True
+  (InTransit loc) == (InTransit loc') =
+    loc == loc'
+  (InTransitRejected loc) == (InTransitRejected loc') =
+    loc == loc'
+  (Delivered _) == (Delivered _) = True
+  (Rejected _) == (Rejected _) = True
+  _ == _ = False
 
 PlutusTx.unstableMakeIsData ''BoLTrackerState
 PlutusTx.makeLift ''BoLTrackerState
@@ -89,7 +94,8 @@ PlutusTx.makeLift ''BoLSignature
 data BoLTrackerActions
   = FinishLoading
   | CurrentLocation BuiltinByteString
-  | UnloadFreight BoLSignature (Maybe BuiltinByteString)
+  | UnloadFreight BoLSignature BuiltinByteString
+  | Claim
   deriving (Show, Prelude.Eq)
 
 PlutusTx.unstableMakeIsData ''BoLTrackerActions
@@ -102,21 +108,23 @@ transition btp s r = case (stateValue s, stateData s, r) of
     Just (Constraints.mustBeSignedBy (btpShipper btp), State (InTransit []) v)
   (v, InTransit locations, CurrentLocation location) ->
     Just (Constraints.mustBeSignedBy (btpCarrier btp), State (InTransit $ locations ++ [location]) v)
-  (v, InTransit _, UnloadFreight Accept maybeNotes) ->
-    Just (Constraints.mustBeSignedBy (btpReciver btp), State (Delivered maybeNotes) v)
-  (v, InTransit _, UnloadFreight Reject maybeNotes) ->
-    Just (Constraints.mustBeSignedBy (btpReciver btp), State (Rejected maybeNotes) v)
+  (v, InTransit _, UnloadFreight Accept notes) ->
+    Just (Constraints.mustBeSignedBy (btpReciver btp), State (Delivered notes) v)
+  (v, InTransit _, UnloadFreight Reject notes) ->
+    Just (Constraints.mustBeSignedBy (btpReciver btp), State (Rejected notes) v)
   (v, Rejected _, CurrentLocation location) ->
     Just (Constraints.mustBeSignedBy (btpCarrier btp), State (InTransitRejected [location]) v)
   (v, InTransitRejected locations, CurrentLocation location) ->
     Just (Constraints.mustBeSignedBy (btpCarrier btp), State (InTransitRejected $ locations ++ [location]) v)
-  (v, InTransitRejected _, UnloadFreight Accept maybeNotes) ->
-    Just (Constraints.mustBeSignedBy (btpCarrier btp), State (Delivered maybeNotes) v)
+  (v, InTransitRejected _, UnloadFreight Accept notes) ->
+    Just (Constraints.mustBeSignedBy (btpShipper btp), State (Delivered notes) v)
+  (_, Delivered _, Claim) ->
+    Just (Constraints.mustBeSignedBy (btpCarrier btp), State Finished mempty)
   _ -> Nothing
 
 {-# INLINEABLE isFinal #-}
 isFinal :: BoLTrackerState -> Bool
-isFinal (Delivered _) = True
+isFinal Finished = True
 isFinal _ = False
 
 {-# INLINEABLE btpStateMachine #-}
@@ -175,7 +183,37 @@ finishLoading :: BoLTrackerParams -> Contract w s Text ()
 finishLoading btp = void $ mapErrorSM $ runStep (btpClient btp) FinishLoading
 
 updateLocation :: BoLTrackerParams -> BuiltinByteString -> Contract w s Text ()
-updateLocation btp location = void $ mapErrorSM $ runStep (btpClient btp) $ CurrentLocation location
+updateLocation btp location = do
+  let client = btpClient btp
+  m <- mapErrorSM $ getOnChainState client
+  case m of
+    Nothing -> throwError "Contract not found"
+    Just (o, _) -> case tyTxOutData $ tyTxOutRefOut $ ocsTxOutRef o of
+      InTransit _ -> do
+        logInfo @String "Freight is in transit. Updating current location..."
+        void $ mapErrorSM $ runStep client $ CurrentLocation location
+      Rejected _ -> do
+        logInfo @String "Freight is rejected. Sending back to shipper..."
+        void $ mapErrorSM $ runStep client $ CurrentLocation location
+      InTransitRejected _ -> do
+        logInfo @String "Freight is being returned. Updating current location..."
+        void $ mapErrorSM $ runStep client $ CurrentLocation location
+      _ -> logInfo @String "Wrong contract state"
+
+unloadFreight :: BoLTrackerParams -> BoLSignature -> BuiltinByteString -> Contract w s Text ()
+unloadFreight btp s notes = void $ mapErrorSM $ runStep (btpClient btp) $ UnloadFreight s notes
+
+claimReward :: BoLTrackerParams -> Contract w s Text ()
+claimReward btp = void $ mapErrorSM $ runStep (btpClient btp) Claim
+
+data UnloadFreightParams = UnloadFreightParams
+  { bolSignature :: BoLSignature,
+    notes :: BuiltinByteString
+  }
+  deriving (Show, Generic, FromJSON, ToJSON)
+
+PlutusTx.unstableMakeIsData ''UnloadFreightParams
+PlutusTx.makeLift ''UnloadFreightParams
 
 type BTPStartSchema =
   Endpoint "start contract" StartBTP
@@ -183,6 +221,8 @@ type BTPStartSchema =
 type BTPUseSchema =
   Endpoint "finish loading" ()
     .\/ Endpoint "update location" BuiltinByteString
+    .\/ Endpoint "unload freight" UnloadFreightParams
+    .\/ Endpoint "claim reward" ()
 
 startEndpoint :: Contract (Last BoLTrackerParams) BTPStartSchema Text ()
 startEndpoint =
@@ -194,14 +234,18 @@ startEndpoint =
 
 useEndpoints' ::
   ( HasEndpoint "finish loading" () s,
-    HasEndpoint "update location" BuiltinByteString s
+    HasEndpoint "update location" BuiltinByteString s,
+    HasEndpoint "unload freight" UnloadFreightParams s,
+    HasEndpoint "claim reward" () s
   ) =>
   BoLTrackerParams ->
   Promise () s Text ()
-useEndpoints' btp = finishLoading' `select` updateLocation'
+useEndpoints' btp = finishLoading' `select` updateLocation' `select` unloadFreight' `select` claimReward'
   where
     finishLoading' = endpoint @"finish loading" $ \() -> handleError logError (finishLoading btp)
     updateLocation' = endpoint @"update location" $ \location -> handleError logError (updateLocation btp location)
+    unloadFreight' = endpoint @"unload freight" $ \UnloadFreightParams {bolSignature, notes} -> handleError logError (unloadFreight btp bolSignature notes)
+    claimReward' = endpoint @"claim reward" $ \() -> handleError logError (claimReward btp)
 
 useEndpoints :: BoLTrackerParams -> Contract () BTPUseSchema Text ()
 useEndpoints = forever . awaitPromise . useEndpoints'
