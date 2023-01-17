@@ -10,4 +10,5 @@ This is pet project to demonstrate and learn how to write smart contracts on Car
 3. From root of plutus-apps run `nix-shell`
 4. Once in nix shell navigate to bol-tracker project root directory 
 5. Run `cabal update` next `cabal build` and finally `cabal repl`
-6. To execute sample transactions run `runContract AllGood` to test happy path or `runContract Rejected` to test alternative branch
+6. Next you need to load test module by running `:l TestBoLTracker`
+7. To execute sample transactions run `runContract AllGood` to test happy path or `runContract Rejected` to test alternative branch
